@@ -20,3 +20,6 @@ target_link_libraries(ukf_demo PRIVATE ukf)
 
 add_executable(ukf_smoke tests/smoke.cpp)
 target_link_libraries(ukf_smoke PRIVATE ukf)
+
+add_executable(ukf_robustness tests/robustness.cpp)
+target_link_libraries(ukf_robustness PRIVATE ukf)

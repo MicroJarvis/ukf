@@ -1,5 +1,7 @@
 #include "ukf.h"
 
+#include <Eigen/Eigenvalues>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -11,6 +13,23 @@ namespace {
 constexpr double kQuaternionNormFloor = 1e-12;
 constexpr double kCovarianceJitterBase = 1e-12;
 constexpr int kCovarianceJitterTries = 6;
+constexpr double kTimestampTolerance = 1e-9;
+
+template <typename MatrixType>
+void projectToPositiveSemidefinite(MatrixType& matrix, double variance_floor) {
+    matrix = 0.5 * (matrix + matrix.transpose());
+
+    Eigen::SelfAdjointEigenSolver<MatrixType> eigensolver(matrix);
+    if (eigensolver.info() != Eigen::Success || !eigensolver.eigenvalues().array().isFinite().all()) {
+        matrix = variance_floor * MatrixType::Identity();
+        return;
+    }
+
+    const auto eigenvectors = eigensolver.eigenvectors();
+    const auto eigenvalues = eigensolver.eigenvalues().cwiseMax(variance_floor);
+    matrix = eigenvectors * eigenvalues.asDiagonal() * eigenvectors.transpose();
+    matrix = 0.5 * (matrix + matrix.transpose());
+}
 
 Quaternion averageQuaternion(const std::vector<Quaternion>& quaternions,
                              const Eigen::VectorXd& weights) {
@@ -40,7 +59,13 @@ PoseUKF::PoseUKF()
       kappa_(0.0),
       mahalanobis_gate_(25.0),
       covariance_floor_(1e-10),
+      last_timestamp_(0.0),
+      latest_observation_timestamp_(0.0),
+      last_nis_(0.0),
+      last_sequence_(0),
       initialized_(false),
+      has_timestamp_(false),
+      has_sequence_(false),
       status_(Status::kNotInitialized) {
     x_.setZero();
     x_(6) = 1.0;
@@ -52,6 +77,8 @@ PoseUKF::PoseUKF()
     R_ *= 1e-3;
     lambda_ = alpha_ * alpha_ * (kErrorDim + kappa_) - kErrorDim;
     stabilizeCovariance(P_);
+    stabilizeCovariance(Q_);
+    stabilizeMeasurementCovariance(R_);
 }
 
 bool PoseUKF::initialize(const PoseMeasurement& m, double pos_var, double ori_var) {
@@ -77,6 +104,13 @@ bool PoseUKF::initialize(const PoseMeasurement& m, double pos_var, double ori_va
     P_.block<3, 3>(9, 9) = 1e-2 * Eigen::Matrix3d::Identity();
     stabilizeCovariance(P_);
     normalizeState(x_);
+    stats_ = {};
+    last_nis_ = 0.0;
+    has_timestamp_ = true;
+    last_timestamp_ = m.timestamp;
+    latest_observation_timestamp_ = m.timestamp;
+    has_sequence_ = m.sequence != 0;
+    last_sequence_ = m.sequence;
     initialized_ = true;
     return setStatus(Status::kOk, true);
 }
@@ -87,12 +121,14 @@ void PoseUKF::setProcessNoise(double pos_noise, double vel_noise, double ori_noi
     Q_.block<3, 3>(3, 3) = std::max(vel_noise, covariance_floor_) * Eigen::Matrix3d::Identity();
     Q_.block<3, 3>(6, 6) = std::max(ori_noise, covariance_floor_) * Eigen::Matrix3d::Identity();
     Q_.block<3, 3>(9, 9) = std::max(ang_noise, covariance_floor_) * Eigen::Matrix3d::Identity();
+    stabilizeCovariance(Q_);
 }
 
 void PoseUKF::setMeasurementNoise(double pos_noise, double ori_noise) {
     R_.setZero();
     R_.block<3, 3>(0, 0) = std::max(pos_noise, covariance_floor_) * Eigen::Matrix3d::Identity();
     R_.block<3, 3>(3, 3) = std::max(ori_noise, covariance_floor_) * Eigen::Matrix3d::Identity();
+    stabilizeMeasurementCovariance(R_);
 }
 
 void PoseUKF::setMahalanobisGate(double nis_threshold) {
@@ -104,6 +140,7 @@ void PoseUKF::setCovarianceFloor(double variance_floor) {
         covariance_floor_ = variance_floor;
         stabilizeCovariance(P_);
         stabilizeCovariance(Q_);
+        stabilizeMeasurementCovariance(R_);
     }
 }
 
@@ -117,6 +154,10 @@ const char* PoseUKF::lastStatusMessage() const {
             return "invalid argument";
         case Status::kRejectedMeasurement:
             return "measurement rejected by gate";
+        case Status::kTimestampRegression:
+            return "measurement timestamp regressed";
+        case Status::kSequenceRegression:
+            return "measurement sequence regressed";
         case Status::kNumericalFailure:
             return "numerical failure";
     }
@@ -149,6 +190,7 @@ bool PoseUKF::predict(double dt) {
     P_ = covarianceFromSigma(pred_sigma, x_, wc) + Q_;
     normalizeState(x_);
     stabilizeCovariance(P_);
+    ++stats_.predict_count;
     return setStatus(Status::kOk, true);
 }
 
@@ -157,8 +199,24 @@ bool PoseUKF::update(const PoseMeasurement& m) {
         return setStatus(Status::kNotInitialized, false);
     }
     if (!validateMeasurement(m)) {
+        ++stats_.invalid_update_count;
         return setStatus(Status::kInvalidArgument, false);
     }
+    if (has_timestamp_ && m.timestamp <= latest_observation_timestamp_ + kTimestampTolerance) {
+        ++stats_.stale_update_count;
+        ++stats_.rejected_update_count;
+        return setStatus(Status::kTimestampRegression, false);
+    }
+    if (m.sequence != 0) {
+        if (has_sequence_ && m.sequence <= last_sequence_) {
+            ++stats_.stale_update_count;
+            ++stats_.rejected_update_count;
+            return setStatus(Status::kSequenceRegression, false);
+        }
+        has_sequence_ = true;
+    }
+
+    latest_observation_timestamp_ = m.timestamp;
 
     SigmaSet sigma;
     if (!generateSigmaPoints(sigma)) {
@@ -175,30 +233,34 @@ bool PoseUKF::update(const PoseMeasurement& m) {
     computeWeights(wm, wc);
 
     const MeasurementSample z_mean = measurementMeanFromSigma(z_sigma, wm);
-    MeasMat S = measurementCovFromSigma(z_sigma, z_mean, wc) + R_;
-    S = 0.5 * (S + S.transpose());
-    S.diagonal().array() += covariance_floor_;
+    MeasMat S = measurementCovFromSigma(z_sigma, z_mean, wc) + effectiveMeasurementNoise(m);
+    stabilizeMeasurementCovariance(S);
 
     const CrossMat Pxz = crossCovariance(sigma, x_, z_sigma, z_mean, wc);
     const MeasVec innovation = measurementDifference(z_mean, makeMeasurementSample(m));
 
     Eigen::LDLT<MeasMat> ldlt(S);
     if (ldlt.info() != Eigen::Success) {
+        ++stats_.numerical_failure_count;
         return setStatus(Status::kNumericalFailure, false);
     }
 
     const MeasVec solved_innovation = ldlt.solve(innovation);
     if (ldlt.info() != Eigen::Success || !solved_innovation.array().isFinite().all()) {
+        ++stats_.numerical_failure_count;
         return setStatus(Status::kNumericalFailure, false);
     }
 
     const double nis = innovation.dot(solved_innovation);
+    last_nis_ = nis;
     if (std::isfinite(mahalanobis_gate_) && nis > mahalanobis_gate_) {
+        ++stats_.rejected_update_count;
         return setStatus(Status::kRejectedMeasurement, false);
     }
 
     const ErrorVec dx = Pxz * solved_innovation;
     if (!dx.array().isFinite().all()) {
+        ++stats_.numerical_failure_count;
         return setStatus(Status::kNumericalFailure, false);
     }
 
@@ -206,12 +268,16 @@ bool PoseUKF::update(const PoseMeasurement& m) {
 
     const StateMat correction = Pxz * ldlt.solve(Pxz.transpose());
     if (!correction.array().isFinite().all()) {
+        ++stats_.numerical_failure_count;
         return setStatus(Status::kNumericalFailure, false);
     }
 
     P_ -= correction;
     normalizeState(x_);
     stabilizeCovariance(P_);
+    last_timestamp_ = m.timestamp;
+    last_sequence_ = m.sequence;
+    ++stats_.accepted_update_count;
     return setStatus(Status::kOk, true);
 }
 
@@ -234,6 +300,7 @@ bool PoseUKF::generateSigmaPoints(SigmaSet& sigma) {
     }
 
     if (!factorized) {
+        ++stats_.numerical_failure_count;
         return setStatus(Status::kNumericalFailure, false);
     }
 
@@ -249,7 +316,8 @@ bool PoseUKF::generateSigmaPoints(SigmaSet& sigma) {
 
 bool PoseUKF::validateMeasurement(const PoseMeasurement& m) {
     return m.valid && isFiniteVector(m.position) && isFiniteQuaternion(m.orientation) &&
-           m.orientation.norm() >= kQuaternionNormFloor;
+           m.orientation.norm() >= kQuaternionNormFloor && std::isfinite(m.timestamp) &&
+           (!m.has_covariance || isFiniteMatrix(m.covariance));
 }
 
 PoseUKF::MeasurementSample PoseUKF::makeMeasurementSample(const PoseMeasurement& m) {
@@ -259,16 +327,26 @@ PoseUKF::MeasurementSample PoseUKF::makeMeasurementSample(const PoseMeasurement&
     return sample;
 }
 
+PoseUKF::MeasMat PoseUKF::effectiveMeasurementNoise(const PoseMeasurement& m) const {
+    MeasMat effective = R_;
+    if (m.has_covariance) {
+        effective += m.covariance;
+    }
+    stabilizeMeasurementCovariance(effective);
+    return effective;
+}
+
 bool PoseUKF::setStatus(Status status, bool ok) {
     status_ = status;
     return ok;
 }
 
 void PoseUKF::stabilizeCovariance(StateMat& P) const {
-    P = 0.5 * (P + P.transpose());
-    for (int i = 0; i < kErrorDim; ++i) {
-        P(i, i) = std::max(P(i, i), covariance_floor_);
-    }
+    projectToPositiveSemidefinite(P, covariance_floor_);
+}
+
+void PoseUKF::stabilizeMeasurementCovariance(MeasMat& R) const {
+    projectToPositiveSemidefinite(R, covariance_floor_);
 }
 
 void PoseUKF::computeWeights(Eigen::Matrix<double, kSigmaCount, 1>& wm,

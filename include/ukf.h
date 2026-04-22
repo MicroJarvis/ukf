@@ -3,6 +3,7 @@
 #include "pose_utils.h"
 #include <Eigen/Dense>
 #include <array>
+#include <cstddef>
 #include <vector>
 
 namespace ukf {
@@ -26,7 +27,18 @@ public:
         kNotInitialized,
         kInvalidArgument,
         kRejectedMeasurement,
+        kTimestampRegression,
+        kSequenceRegression,
         kNumericalFailure,
+    };
+
+    struct Statistics {
+        std::size_t predict_count{0};
+        std::size_t accepted_update_count{0};
+        std::size_t rejected_update_count{0};
+        std::size_t stale_update_count{0};
+        std::size_t invalid_update_count{0};
+        std::size_t numerical_failure_count{0};
     };
 
     PoseUKF();
@@ -45,6 +57,8 @@ public:
     bool initialized() const { return initialized_; }
     Status lastStatus() const { return status_; }
     const char* lastStatusMessage() const;
+    const Statistics& statistics() const { return stats_; }
+    double lastNormalizedInnovationSquared() const { return last_nis_; }
 
     Vec3 position() const;
     Vec3 velocity() const;
@@ -62,8 +76,15 @@ private:
     double lambda_;
     double mahalanobis_gate_;
     double covariance_floor_;
+    double last_timestamp_;
+    double latest_observation_timestamp_;
+    double last_nis_;
+    std::uint64_t last_sequence_;
     bool initialized_;
+    bool has_timestamp_;
+    bool has_sequence_;
     Status status_;
+    Statistics stats_;
 
     struct MeasurementSample {
         Vec3 position{Vec3::Zero()};
@@ -76,8 +97,10 @@ private:
     bool generateSigmaPoints(SigmaSet& sigma);
     static bool validateMeasurement(const PoseMeasurement& m);
     static MeasurementSample makeMeasurementSample(const PoseMeasurement& m);
+    MeasMat effectiveMeasurementNoise(const PoseMeasurement& m) const;
     bool setStatus(Status status, bool ok);
     void stabilizeCovariance(StateMat& P) const;
+    void stabilizeMeasurementCovariance(MeasMat& R) const;
     void computeWeights(Eigen::Matrix<double, kSigmaCount, 1>& wm,
                         Eigen::Matrix<double, kSigmaCount, 1>& wc) const;
     static void normalizeState(StateVec& x);

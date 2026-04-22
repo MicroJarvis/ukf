@@ -7,6 +7,10 @@ bool isFiniteVector(const Vec3& v) {
     return v.array().isFinite().all();
 }
 
+bool isFiniteMatrix(const Mat6& m) {
+    return m.array().isFinite().all();
+}
+
 bool isFiniteQuaternion(const Quaternion& q) {
     return std::isfinite(q.w()) && std::isfinite(q.x()) &&
            std::isfinite(q.y()) && std::isfinite(q.z());
